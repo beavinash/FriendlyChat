@@ -60,12 +60,23 @@ class FCViewController: UIViewController, UITableViewDataSource, UITableViewDele
   }
 
   deinit {
+    if let refHandle = _refHandle {
+        self.ref.child("messages").removeObserver(withHandle: _refHandle)
+    }
   }
 
   func configureDatabase() {
+    ref = FIRDatabase.database().reference()
+    // Listen for new messages in the firebase database
+    _refHandle = self.ref.child("messages").observe(.childAdded, with: { [weak self](snapshot) in
+        guard let strongSelf = self else {return}
+        strongSelf.messages.append(snapshot)
+        strongSelf.clientTable.insertRows(at: [IndexPath(row: strongSelf.messages.count-1, section: 0)], with: .automatic)
+    })
   }
 
   func configureStorage() {
+    storageRef = FIRStorage.storage().reference()
   }
 
   func configureRemoteConfig() {
@@ -107,12 +118,38 @@ class FCViewController: UIViewController, UITableViewDataSource, UITableViewDele
     return messages.count
   }
 
-  func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-    // Dequeue cell
-    let cell = self.clientTable.dequeueReusableCell(withIdentifier: "tableViewCell", for: indexPath)
-
-    return cell
-  }
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        // Dequeue cell
+        let cell = self.clientTable .dequeueReusableCell(withIdentifier: "tableViewCell", for: indexPath)
+        // Unpack message from Firebase DataSnapshot
+        let messageSnapshot: FIRDataSnapshot! = self.messages[indexPath.row]
+        guard let message = messageSnapshot.value as? [String:String] else { return cell }
+        let name = message[Constants.MessageFields.name] ?? ""
+        if let imageURL = message[Constants.MessageFields.imageURL] {
+            if imageURL.hasPrefix("gs://") {
+                FIRStorage.storage().reference(forURL: imageURL).data(withMaxSize: INT64_MAX) {(data, error) in
+                    if let error = error {
+                        print("Error downloading: \(error)")
+                        return
+                    }
+                    cell.imageView?.image = UIImage.init(data: data!)
+                    tableView.reloadData()
+                }
+            } else if let URL = URL(string: imageURL), let data = try? Data(contentsOf: URL) {
+                cell.imageView?.image = UIImage.init(data: data)
+            }
+            cell.textLabel?.text = "sent by: \(name)"
+        } else {
+            let text = message[Constants.MessageFields.text] ?? ""
+            cell.textLabel?.text = name + ": " + text
+            cell.imageView?.image = UIImage(named: "ic_account_circle")
+            if let photoURL = message[Constants.MessageFields.photoURL], let URL = URL(string: photoURL),
+                let data = try? Data(contentsOf: URL) {
+                cell.imageView?.image = UIImage(data: data)
+            }
+        }
+        return cell
+    }
 
   // UITextViewDelegate protocol methods
   func textFieldShouldReturn(_ textField: UITextField) -> Bool {
@@ -125,6 +162,14 @@ class FCViewController: UIViewController, UITableViewDataSource, UITableViewDele
   }
 
   func sendMessage(withData data: [String: String]) {
+    var mdata = data
+    mdata[Constants.MessageFields.name] = FIRAuth.auth()?.currentUser?.displayName
+    if let photoUrl = FIRAuth.auth()?.currentUser?.photoURL {
+        mdata[Constants.MessageFields.photoURL] = photoUrl.absoluteString
+    }
+    
+    // push data to firebase
+    self.ref.child("messages").childByAutoId().setValue(mdata)
   }
 
   // MARK: - Image Picker
@@ -141,26 +186,46 @@ class FCViewController: UIViewController, UITableViewDataSource, UITableViewDele
     present(picker, animated: true, completion:nil)
   }
 
-  func imagePickerController(_ picker: UIImagePickerController,
-    didFinishPickingMediaWithInfo info: [String : Any]) {
-      picker.dismiss(animated: true, completion:nil)
-    guard let uid = FIRAuth.auth()?.currentUser?.uid else { return }
-
-    // if it's a photo from the library, not an image from the camera
-    if #available(iOS 8.0, *), let referenceURL = info[UIImagePickerControllerReferenceURL] as? URL {
-      let assets = PHAsset.fetchAssets(withALAssetURLs: [referenceURL], options: nil)
-      let asset = assets.firstObject
-      asset?.requestContentEditingInput(with: nil, completionHandler: { (contentEditingInput, info) in
-        let imageFile = contentEditingInput?.fullSizeImageURL
-        let filePath = "\(uid)/\(Int(Date.timeIntervalSinceReferenceDate * 1000))/\((referenceURL as AnyObject).lastPathComponent!)"
-      })
-    } else {
-      guard let image = info[UIImagePickerControllerOriginalImage] as? UIImage else { return }
-      let imageData = UIImageJPEGRepresentation(image, 0.8)
-      guard let uid = FIRAuth.auth()?.currentUser?.uid else { return }
-      let imagePath = "\(uid)/\(Int(Date.timeIntervalSinceReferenceDate * 1000)).jpg"
+    func imagePickerController(_ picker: UIImagePickerController,
+                               didFinishPickingMediaWithInfo info: [String : Any]) {
+        picker.dismiss(animated: true, completion:nil)
+        guard let uid = FIRAuth.auth()?.currentUser?.uid else { return }
+        
+        // if it's a photo from the library, not an image from the camera
+        if #available(iOS 8.0, *), let referenceURL = info[UIImagePickerControllerReferenceURL] as? URL {
+            let assets = PHAsset.fetchAssets(withALAssetURLs: [referenceURL], options: nil)
+            let asset = assets.firstObject
+            asset?.requestContentEditingInput(with: nil, completionHandler: { [weak self] (contentEditingInput, info) in
+                let imageFile = contentEditingInput?.fullSizeImageURL
+                let filePath = "\(uid)/\(Int(Date.timeIntervalSinceReferenceDate * 1000))/\((referenceURL as AnyObject).lastPathComponent!)"
+                guard let strongSelf = self else { return }
+                strongSelf.storageRef.child(filePath)
+                    .putFile(imageFile!, metadata: nil) { (metadata, error) in
+                        if let error = error {
+                            let nsError = error as NSError
+                            print("Error uploading: \(nsError.localizedDescription)")
+                            return
+                        }
+                        strongSelf.sendMessage(withData: [Constants.MessageFields.imageURL: strongSelf.storageRef.child((metadata?.path)!).description])
+                }
+            })
+        } else {
+            guard let image = info[UIImagePickerControllerOriginalImage] as? UIImage else { return }
+            let imageData = UIImageJPEGRepresentation(image, 0.8)
+            let imagePath = "\(uid)/\(Int(Date.timeIntervalSinceReferenceDate * 1000)).jpg"
+            let metadata = FIRStorageMetadata()
+            metadata.contentType = "image/jpeg"
+            self.storageRef.child(imagePath)
+                .put(imageData!, metadata: metadata) { [weak self] (metadata, error) in
+                    if let error = error {
+                        print("Error uploading: \(error)")
+                        return
+                    }
+                    guard let strongSelf = self else { return }
+                    strongSelf.sendMessage(withData: [Constants.MessageFields.imageURL: strongSelf.storageRef.child((metadata?.path)!).description])
+            }
+        }
     }
-  }
 
   func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
     picker.dismiss(animated: true, completion:nil)
